@@ -1,0 +1,61 @@
+# ---- 데이터 경로 -----------------------------------------------------------
+paths:
+  velo_root: "D:/dataset/sequences"                          # velodyne/*.bin
+  lbl_root:  "D:/data_odometry_labels/dataset/sequences"     # labels/*.label
+  out_root:  "out_bev"                                       # 출력 폴더(상대경로 OK)
+
+# ---- ROI & BEV -------------------------------------------------------------
+roi:
+  x_min: 0.0
+  x_max: 60.0
+  y_min: -20.0
+  y_max: 20.0
+  z_min: -2.5
+  z_max: 2.5
+  resolution: 0.8   # meters per cell
+
+# ---- 클래스 ID (SemanticKITTI) ---------------------------------------------
+class_ids:
+  # car, truck, bus, other-vehicle
+  vehicle: [10, 18, 19, 20]
+  # road, sidewalk, building, fence, vegetation, pole, sign
+  static:  [48, 50, 51, 70, 80, 81]
+
+# ---- 미리보기/실험 파라미터 -----------------------------------------------
+preview:
+  sequences: ["08"]   # 돌릴 시퀀스 리스트
+  n_frames: 0   # 미사용이면 0
+  start: 0
+  end: 300
+
+# ---- 클러스터링(DBSCAN) / 추적(예정) --------------------------------------
+cluster:
+  eps: 0.8
+  min_samples: 12
+  min_points_cluster: 20
+
+window:
+  seconds: 4.0
+  fps: 10.0
+
+analysis:
+  tau_persist_frames: 15
+  tau_flow_dx_med: 0.5
+  diversity_K: 3
+  front_band_m: [5.0, 25.0]
+
+  # 분류/신뢰도 임계치 (초기값, 데이터 맞춰 튜닝)
+  v_slow: 2.0          # m/s
+  v_fast: 6.0          # m/s
+  std_high: 1.5        # m/s
+  dwell_high: 10       # frames
+  uid_low: 3
+
+  sc_low: 0.05         # static_change_rate 낮음(ego 정차)
+  sc_high: 0.15        # static_change_rate 높음(ego 주행)
+
+  slow_min: 0.2        # m/s
+  slow_max: 1.0        # m/s
+
+  min_samples: 5       # 셀 신뢰도(속도 샘플 최소 개수)
+
