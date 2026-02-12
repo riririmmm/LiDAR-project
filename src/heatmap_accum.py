@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 track_heatmaps.py  (fixed)
 - Vehicle 포인트를 DBSCAN → 간단 트래킹 → 속도/체류/고유ID 히트맵 생성/저장
@@ -20,8 +19,6 @@ import matplotlib.pyplot as plt
 import re
 from typing import List, Dict, Tuple, Optional
 from sklearn.cluster import DBSCAN
-
-from src.event_encoder import encode_event_type, EncoderConfig
 
 # ----------------------------------------------------------------------
 # 사용자 조정 영역
@@ -250,18 +247,20 @@ class TrackManager:
                 tr.n = counts[best_j]
                 tr.history.append(new)
 
-                # 속도 계산: '가려짐(age>0)'이면 그만큼 dt를 늘려서 나눔
+                # 속도는 '과거 위치가 있을 때'만 계산 (history 길이 ≥ 2)
+                #   v = 프레임간 이동거리 / Δt  (단위: m/s)
                 if len(tr.history) >= 2:
-                    gap_frames = tr.age  # update() 맨 앞에서 age를 +1 했으므로 "연속 매칭"이면 gap_frames=1
-                    effective_dt = self.dt * max(1, gap_frames)
-                    tr.speed = self._dist(old, new) / effective_dt
+                    prev = tr.history[-2]  # 직전 관측 위치(확실)
+                    gap_frames = max(1, tr.age)  # 마지막 관측 이후 경과 프레임
+                    dt_eff = self.dt * gap_frames
+                    tr.speed = self._dist(prev, new) / dt_eff
                     tr.has_velocity = True
 
-                # 매칭되었으니 상태 리셋/표시
+                # 관측되었으므로 age 리셋 및 플래그 갱신
                 tr.age = 0
-                tr.just_updated = True
+                tr.just_updated = True  # 이번 프레임에 매칭됨
 
-                # 이 detection은 소비 처리(다른 트랙이 또 못 쓰게)
+                # 해당 detection은 더 이상 다른 트랙에 쓸 수 없으므로 제거
                 unmatched_det.remove(best_j)
 
         # 3) 남아있는 detection들은 기존 트랙과 매칭되지 못했으므로 "신규 트랙"으로 생성
@@ -363,7 +362,7 @@ def main():
     # 입력 폴더(포인트, 라벨)와 출력 루트 폴더(여긴 out_metrics/<seq>/로 저장)를 절대 경로로 정리
     velo_root = Path(str(cfg.paths.velo_root)).resolve()
     lbl_root  = Path(str(cfg.paths.lbl_root)).resolve()
-    out_root  = (Path.cwd() / "out_metrics").resolve()
+    out_root = Path(str(cfg.paths.out_root)).resolve()
 
     # ROI(관심 영역)와 격자 해상도: 이후 좌표→셀 인덱스 변환에 사용
     X_MIN, X_MAX = cfg.roi.x_min, cfg.roi.x_max
@@ -585,27 +584,6 @@ def main():
         # d) 정적 변화율 계산 (정규화: (T-1)로 나눠 0~1 근사)
         T_eff = max(1, len(pairs) - 1)
         static_change_rate = static_change_count.astype(np.float32) / float(T_eff)
-
-        event_type, feats = encode_event_type(
-            unique_cnt_map=unique_cnt.astype(np.float32),
-            mean_speed_map=mean_v.astype(np.float32),
-            dwell_map=dwell.astype(np.float32),
-            cfg=EncoderConfig(
-                density_cap=5.0,
-                v_low=2.0,
-                v_ok=6.0,
-                occ_high=0.6,
-                topk_ratio=0.05
-            ),
-            static_dwell_map=static_dwell.astype(np.float32),
-            static_change_rate=static_change_rate.astype(np.float32),
-        )
-
-        (out_dir / "event_type.txt").write_text(
-            f"event_type: {event_type}\nfeats: {feats}\n",
-            encoding="utf-8"
-        )
-        print("[EVENT]", event_type, feats)
 
         # e) 기초 결과 저장(샘플/속도/정적)
         save_map(out_dir / "speed_samples.png",
