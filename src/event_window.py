@@ -434,7 +434,29 @@ class EventWindow:
         if feats.get("empty_like", False):
             etype = "Empty"
 
+        # --- debug/useful summary features ---
+        feats["vehicle_count_mean"] = float(np.mean(roi_counts)) if len(roi_counts) > 0 else 0.0
+        feats["vehicle_count_max"] = float(np.max(roi_counts)) if len(roi_counts) > 0 else 0.0
+
+        # self.dwell: window 동안 누적된 occupancy/heatmap 성격의 맵
+        feats["heatmap_sum"] = float(np.sum(self.dwell))
+        feats["heatmap_mean"] = float(np.mean(self.dwell))
+
         feats["occupancy_mean"] = occ_mean
         feats["occupancy_max"] = occ_max
         feats["stopped_ratio"] = float(stopped_ratio)
+
+        # 변화 기반 feature 추가
+        feats["vehicle_count_std"] = float(np.std(roi_counts)) if len(roi_counts) > 0 else 0.0
+
+        if len(roi_counts) > 1:
+            feats["vehicle_count_diff"] = float(roi_counts[-1] - roi_counts[0])
+        else:
+            feats["vehicle_count_diff"] = 0.0
+
+        if len(ego_speed_series) > 1:
+            feats["ego_speed_diff"] = float(ego_speed_series[-1] - ego_speed_series[0])
+        else:
+            feats["ego_speed_diff"] = 0.0
+
         return etype, feats
