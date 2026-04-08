@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+import csv
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -41,35 +42,30 @@ class SimConfig:
     # PF 안정화 상수
     pf_epsilon: float = 1e-6
 
-    # 시나리오별 환경 생성용
-    arrival_congestion: float = 35.0
-    arrival_normal: float = 20.0
-    arrival_empty: float = 10.0
+    # RB marginal efficiency decay
+    # same user gets more RBs in a slot -> marginal gain decreases
+    rb_efficiency_decay: float = 0.35
 
-    gain_mu_congestion: float = -2.0
-    gain_sigma_congestion: float = 0.75
-    gain_mu_normal: float = -0.8
-    gain_sigma_normal: float = 0.45
-    gain_mu_empty: float = -0.2
-    gain_sigma_empty: float = 0.30
+    # Limit for requested RB search
+    rb_demand_cap_factor: float = 2.0
 
-    # 공정 비교용 Ours 계수
-    ours_rate_coeff_cong: float = 0.45
-    ours_queue_coeff_cong: float = 0.80
-    ours_starve_coeff_cong: float = 0.85
-    ours_wait_coeff_cong: float = 0.70
+    # Ours coefficients
+    ours_rate_coeff_cong: float = 0.55
+    ours_queue_coeff_cong: float = 0.45
+    ours_starve_coeff_cong: float = 0.45
+    ours_wait_coeff_cong: float = 0.30
 
-    ours_rate_coeff_normal: float = 0.60
-    ours_queue_coeff_normal: float = 0.55
-    ours_starve_coeff_normal: float = 0.45
-    ours_wait_coeff_normal: float = 0.35
+    ours_rate_coeff_normal: float = 0.65
+    ours_queue_coeff_normal: float = 0.30
+    ours_starve_coeff_normal: float = 0.20
+    ours_wait_coeff_normal: float = 0.15
 
-    ours_rate_coeff_empty: float = 0.85
-    ours_queue_coeff_empty: float = 0.25
-    ours_starve_coeff_empty: float = 0.20
-    ours_wait_coeff_empty: float = 0.15
+    ours_rate_coeff_empty: float = 0.75
+    ours_queue_coeff_empty: float = 0.15
+    ours_starve_coeff_empty: float = 0.10
+    ours_wait_coeff_empty: float = 0.05
 
-    # 공정 비교용 OursPF 계수
+    # OursPF coefficients
     ourspf_queue_coeff_cong: float = 0.65
     ourspf_starve_coeff_cong: float = 0.95
     ourspf_wait_coeff_cong: float = 0.75
@@ -83,20 +79,21 @@ class SimConfig:
     ourspf_wait_coeff_empty: float = 0.05
 
     # 이번 슬롯 내 과몰빵 방지
-    intra_slot_decay_ours: float = 0.35
+    intra_slot_decay_ours: float = 0.80
     intra_slot_decay_ourspf: float = 0.20
 
     # 디버그 옵션
     debug_slots: int = 10
     debug_every: int = 0
     save_debug_csv: bool = True
-    rb_demand_cap_factor: float = 2.0
 
 
 @dataclass
 class Vehicle:
     vid: int
     state: str  # 환경 생성용으로만 유지
+    long_gain: float
+
     queue_bits: float = 0.0
     served_bits_total: float = 0.0
     delay_sum_bits_sec: float = 0.0
@@ -111,12 +108,15 @@ class Metrics:
     scheduler: str
     scenario: str
     run_idx: int
+
     total_throughput_bps: float
     avg_delay_sec: float
     fairness: float
+
     congestion_avg_throughput_bps: float
     normal_avg_throughput_bps: float
     empty_avg_throughput_bps: float
+
     mean_active_users_per_slot: float
     mean_requested_rb_per_slot: float
     mean_allocated_rb_per_slot: float
@@ -164,20 +164,21 @@ def normalize_scenario_name(scenario: str) -> str:
 
 
 STATE_ENV: Dict[str, Dict[str, float]] = {
+    # Higher traffic demand + worse average channel in congestion
     "Congestion": {
         "arrival_pkts": 35.0,
-        "gain_mu": -2.0,
-        "gain_sigma": 0.75,
+        "base_gain": 0.18,
+        "shadow_sigma_db": 2.5,
     },
     "Normal": {
         "arrival_pkts": 20.0,
-        "gain_mu": -0.8,
-        "gain_sigma": 0.45,
+        "base_gain": 0.45,
+        "shadow_sigma_db": 2.0,
     },
     "Empty": {
         "arrival_pkts": 10.0,
-        "gain_mu": -0.2,
-        "gain_sigma": 0.30,
+        "base_gain": 0.90,
+        "shadow_sigma_db": 1.5,
     },
 }
 
@@ -237,13 +238,16 @@ def get_scenario_coeffs_ourspf(scenario: str, cfg: SimConfig) -> Tuple[float, fl
 def build_vehicle_states(scenario: str, n_vehicles: int, rng: np.random.Generator) -> List[str]:
     raw = scenario.strip().lower()
 
-    if raw == "congestion":
-        weights = [0.7, 0.2, 0.1]
-    elif raw == "normal":
-        weights = [0.2, 0.6, 0.2]
-    elif raw == "empty":
-        weights = [0.1, 0.2, 0.7]
-    elif raw == "balanced":
+    # 직접 상태가 들어오면 "혼합 생성"하지 말고 전 차량 동일 상태로 고정
+    if raw in ("congestion", "jam", "trafficjam"):
+        return ["Congestion"] * n_vehicles
+    elif raw in ("normal",):
+        return ["Normal"] * n_vehicles
+    elif raw in ("empty", "light", "sparse"):
+        return ["Empty"] * n_vehicles
+
+    # 아래는 standalone preset scenario에서만 혼합 비율 사용
+    if raw == "balanced":
         weights = [1 / 3, 1 / 3, 1 / 3]
     elif raw == "congestion_heavy":
         weights = [0.6, 0.3, 0.1]
@@ -253,9 +257,8 @@ def build_vehicle_states(scenario: str, n_vehicles: int, rng: np.random.Generato
         weights = [0.1, 0.3, 0.6]
     else:
         raise ValueError(
-            "scenario must be one of: "
-            "balanced, congestion_heavy, normal_heavy, empty_heavy, "
-            "or direct states: Empty, Normal, Congestion"
+            "scenario must be one of: balanced, congestion_heavy, normal_heavy, "
+            "empty_heavy, or direct states: Empty, Normal, Congestion"
         )
 
     states = rng.choice(
@@ -271,11 +274,44 @@ def build_vehicle_states(scenario: str, n_vehicles: int, rng: np.random.Generato
 # =========================================================
 
 
-def sample_channel_gains(states: List[str], rng: np.random.Generator) -> np.ndarray:
-    gains = np.zeros(len(states), dtype=np.float64)
-    for i, s in enumerate(states):
-        env = STATE_ENV[s]
-        gains[i] = rng.lognormal(env["gain_mu"], env["gain_sigma"])
+def make_vehicles(states: List[str], rng: np.random.Generator) -> List[Vehicle]:
+    vehicles: List[Vehicle] = []
+
+    for i, state in enumerate(states):
+        env = STATE_ENV[state]
+
+        base_gain = float(env["base_gain"])
+        sigma_db = float(env["shadow_sigma_db"])
+
+        # Long-term shadowing
+        shadow_db = rng.normal(loc=0.0, scale=sigma_db)
+        shadow_lin = 10.0 ** (shadow_db / 10.0)
+        long_gain = max(base_gain * shadow_lin, 1e-6)
+
+        vehicles.append(
+            Vehicle(
+                vid=i,
+                state=state,
+                long_gain=float(long_gain),
+            )
+        )
+
+    return vehicles
+
+
+def sample_channel_gains(vehicles: List[Vehicle], rng: np.random.Generator) -> np.ndarray:
+    """
+    Simple paper-friendly channel model:
+    - per-vehicle long-term gain
+    - small fast fading per slot
+    """
+    gains = np.zeros(len(vehicles), dtype=np.float64)
+
+    for i, v in enumerate(vehicles):
+        fast_db = rng.normal(loc=0.0, scale=2.0)
+        fast_lin = 10.0 ** (fast_db / 10.0)
+        gains[i] = max(v.long_gain * fast_lin, 1e-6)
+
     return gains
 
 
@@ -285,25 +321,42 @@ def shannon_rate_bits_per_rb(gains: np.ndarray, cfg: SimConfig) -> np.ndarray:
     return (cfg.bandwidth_per_rb_hz * spectral_eff * cfg.slot_sec).astype(np.float64)
 
 
+def marginal_rb_capacity(rate_per_rb: float, rb_index: int, cfg: SimConfig) -> float:
+    decay = 1.0 + cfg.rb_efficiency_decay * rb_index
+    return float(rate_per_rb / decay)
+
+
+def total_capacity_for_alloc(rate_per_rb: float, alloc_rb: int, cfg: SimConfig) -> float:
+    if alloc_rb <= 0:
+        return 0.0
+    return float(sum(marginal_rb_capacity(rate_per_rb, k, cfg) for k in range(alloc_rb)))
+
+
+def estimate_requested_rb(queue_bits: float, rate_per_rb: float, cfg: SimConfig) -> int:
+    if queue_bits <= 0:
+        return 0
+
+    max_rb = max(1, int(cfg.total_rb * cfg.rb_demand_cap_factor))
+    acc = 0.0
+
+    for rb in range(1, max_rb + 1):
+        acc += marginal_rb_capacity(rate_per_rb, rb - 1, cfg)
+        if acc >= queue_bits:
+            return rb
+
+    return max_rb
+
+
 # =========================================================
 # 5) 트래픽 도착 / 큐 처리
 # =========================================================
 
 
-def make_vehicles(states: List[str]) -> List[Vehicle]:
-    return [Vehicle(vid=i, state=s) for i, s in enumerate(states)]
-
-
-def update_arrivals(vehicles: List[Vehicle], cfg: SimConfig, rng: np.random.Generator) -> None:
+def update_arrivals(vehicles: List[Vehicle], rng: np.random.Generator) -> None:
     for v in vehicles:
         lam = STATE_ENV[v.state]["arrival_pkts"]
         arrivals = rng.poisson(lam=lam)
-        bits = float(arrivals * cfg.packet_size_bits)
-        v.queue_bits += bits
-
-
-def cap_allocation_by_request(alloc_rb: np.ndarray, requested_rb: np.ndarray) -> np.ndarray:
-    return np.minimum(alloc_rb, requested_rb).astype(np.int32)
+        v.queue_bits += float(arrivals * 12_000)
 
 
 def serve_queues(
@@ -315,7 +368,7 @@ def serve_queues(
     served_bits_arr = np.zeros(len(vehicles), dtype=np.float64)
 
     for i, v in enumerate(vehicles):
-        capacity_bits = float(alloc_rb[i]) * float(rate_per_rb[i])
+        capacity_bits = total_capacity_for_alloc(float(rate_per_rb[i]), int(alloc_rb[i]), cfg)
         served = min(v.queue_bits, capacity_bits)
 
         if alloc_rb[i] > 0:
@@ -368,27 +421,64 @@ def normalized_wait_pressure(vehicles: List[Vehicle], cfg: SimConfig) -> np.ndar
 # =========================================================
 
 
-def alloc_round_robin(total_rb: int, rr_cursor: int, n_users: int) -> Tuple[np.ndarray, int]:
+def alloc_round_robin(
+    total_rb: int,
+    rr_cursor: int,
+    n_users: int,
+    active_mask: np.ndarray,
+) -> Tuple[np.ndarray, int]:
     alloc = np.zeros(n_users, dtype=np.int32)
+    if not np.any(active_mask):
+        return alloc, rr_cursor
+
     for k in range(total_rb):
-        alloc[(rr_cursor + k) % n_users] += 1
+        idx = (rr_cursor + k) % n_users
+        search_count = 0
+
+        while not active_mask[idx] and search_count < n_users:
+            idx = (idx + 1) % n_users
+            search_count += 1
+
+        if search_count >= n_users:
+            break
+
+        alloc[idx] += 1
+
     new_cursor = (rr_cursor + total_rb) % n_users
     return alloc, new_cursor
 
 
-def alloc_max_throughput(total_rb: int, rate_per_rb: np.ndarray, active_mask: np.ndarray) -> np.ndarray:
-    alloc = np.zeros_like(rate_per_rb, dtype=np.int32)
-    metric = rate_per_rb.astype(np.float64).copy()
-    metric[~active_mask] = -1.0
-
-    if np.all(metric < 0):
+def alloc_max_throughput(
+    total_rb: int,
+    rate_per_rb: np.ndarray,
+    active_mask: np.ndarray,
+    requested_rb: np.ndarray,
+    cfg: SimConfig,
+) -> np.ndarray:
+    alloc = np.zeros_like(requested_rb, dtype=np.int32)
+    if not np.any(active_mask):
         return alloc
 
-    best = int(np.argmax(metric))
-    if metric[best] < 0:
-        return alloc
+    remaining_req = requested_rb.astype(np.int32).copy()
 
-    alloc[best] = total_rb
+    for _ in range(total_rb):
+        feasible = active_mask & (remaining_req > 0)
+        if not np.any(feasible):
+            break
+
+        metric = np.full(len(rate_per_rb), -1.0, dtype=np.float64)
+
+        for i in range(len(rate_per_rb)):
+            if feasible[i]:
+                metric[i] = marginal_rb_capacity(float(rate_per_rb[i]), int(alloc[i]), cfg)
+
+        best = int(np.argmax(metric))
+        if metric[best] < 0:
+            break
+
+        alloc[best] += 1
+        remaining_req[best] -= 1
+
     return alloc
 
 
@@ -398,23 +488,33 @@ def alloc_proportional_fair(
     avg_thr: np.ndarray,
     epsilon: float,
     active_mask: np.ndarray,
+    requested_rb: np.ndarray,
+    cfg: SimConfig,
 ) -> np.ndarray:
-    alloc = np.zeros_like(rate_per_rb, dtype=np.int32)
+    alloc = np.zeros_like(requested_rb, dtype=np.int32)
     if not np.any(active_mask):
         return alloc
 
-    temp_avg = avg_thr.astype(np.float64).copy()
+    remaining_req = requested_rb.astype(np.int32).copy()
 
     for _ in range(total_rb):
-        metric = rate_per_rb / np.maximum(temp_avg, epsilon)
-        metric[~active_mask] = -1.0
-
-        if np.all(metric < 0):
+        feasible = active_mask & (remaining_req > 0)
+        if not np.any(feasible):
             break
 
+        metric = np.full(len(rate_per_rb), -1.0, dtype=np.float64)
+
+        for i in range(len(rate_per_rb)):
+            if feasible[i]:
+                marginal_rate = marginal_rb_capacity(float(rate_per_rb[i]), int(alloc[i]), cfg)
+                metric[i] = marginal_rate / max(avg_thr[i], epsilon)
+
         best = int(np.argmax(metric))
+        if metric[best] < 0:
+            break
+
         alloc[best] += 1
-        temp_avg[best] += rate_per_rb[best] / max(1.0, total_rb)
+        remaining_req[best] -= 1
 
     return alloc
 
@@ -424,36 +524,45 @@ def alloc_ours_weighted_by_state(
     vehicles: List[Vehicle],
     rate_per_rb: np.ndarray,
     cfg: SimConfig,
-    scenario: str,
+    scenario: str,   # 인터페이스 유지용, 내부에서는 사용 안 함
+    requested_rb: np.ndarray,
 ) -> np.ndarray:
     alloc = np.zeros(len(vehicles), dtype=np.int32)
     active_mask = np.array([v.queue_bits > 0 for v in vehicles], dtype=bool)
     if not np.any(active_mask):
         return alloc
 
-    rate_norm = rate_per_rb / max(float(np.max(rate_per_rb)), 1.0)
+    remaining_req = requested_rb.astype(np.int32).copy()
     q_norm = normalized_queue_pressure(vehicles)
     s_norm = normalized_starvation_pressure(vehicles)
     w_norm = normalized_wait_pressure(vehicles, cfg)
 
-    a_rate, a_queue, a_starve, a_wait = get_scenario_coeffs_ours(scenario, cfg)
-    temp_alloc = np.zeros(len(vehicles), dtype=np.float64)
+    max_rate = max(float(np.max(rate_per_rb)), 1.0)
 
     for _ in range(total_rb):
+        feasible = active_mask & (remaining_req > 0)
+        if not np.any(feasible):
+            break
+
         scores = np.full(len(vehicles), -1.0, dtype=np.float64)
 
-        for i, v in enumerate(vehicles):
-            if not active_mask[i]:
+        for i in range(len(vehicles)):
+            if not feasible[i]:
                 continue
 
+            # 차량별 state 기준 계수 적용
+            a_rate, a_queue, a_starve, a_wait = get_scenario_coeffs_ours(vehicles[i].state, cfg)
+
+            marginal_rate = marginal_rb_capacity(float(rate_per_rb[i]), int(alloc[i]), cfg)
+            marginal_rate_norm = marginal_rate / max_rate
+
             score = (
-                a_rate * rate_norm[i]
+                a_rate * marginal_rate_norm
                 + a_queue * q_norm[i]
                 + a_starve * s_norm[i]
                 + a_wait * w_norm[i]
             )
-
-            score /= (1.0 + cfg.intra_slot_decay_ours * temp_alloc[i])
+            score /= (1.0 + cfg.intra_slot_decay_ours * alloc[i])
             scores[i] = score
 
         best = int(np.argmax(scores))
@@ -461,7 +570,7 @@ def alloc_ours_weighted_by_state(
             break
 
         alloc[best] += 1
-        temp_alloc[best] += 1.0
+        remaining_req[best] -= 1
 
     return alloc
 
@@ -472,38 +581,38 @@ def alloc_ours_pf_hybrid(
     rate_per_rb: np.ndarray,
     avg_thr: np.ndarray,
     cfg: SimConfig,
-    scenario: str,
+    scenario: str,   # 인터페이스 유지용, 내부에서는 사용 안 함
+    requested_rb: np.ndarray,
 ) -> np.ndarray:
-    """
-    공정 비교 버전:
-    - PF 기본 metric 유지
-    - hidden vehicle.state 직접 사용 금지
-    - 공개 정보(queue, starvation, waiting)만 추가
-    - scenario는 구간 전체 상태로만 coefficient 선택에 사용
-    """
     alloc = np.zeros(len(vehicles), dtype=np.int32)
     active_mask = np.array([v.queue_bits > 0 for v in vehicles], dtype=bool)
     if not np.any(active_mask):
         return alloc
 
+    remaining_req = requested_rb.astype(np.int32).copy()
     q_norm = normalized_queue_pressure(vehicles)
     s_norm = normalized_starvation_pressure(vehicles)
     w_norm = normalized_wait_pressure(vehicles, cfg)
 
-    b_queue, b_starve, b_wait = get_scenario_coeffs_ourspf(scenario, cfg)
-    temp_avg = avg_thr.astype(np.float64).copy()
-
     for _ in range(total_rb):
+        feasible = active_mask & (remaining_req > 0)
+        if not np.any(feasible):
+            break
+
         scores = np.full(len(vehicles), -1.0, dtype=np.float64)
 
-        for i, _v in enumerate(vehicles):
-            if not active_mask[i]:
+        for i in range(len(vehicles)):
+            if not feasible[i]:
                 continue
 
-            pf_term = rate_per_rb[i] / max(temp_avg[i], cfg.pf_epsilon)
-            bonus = 1.0 + b_queue * q_norm[i] + b_starve * s_norm[i] + b_wait * w_norm[i]
-            score = pf_term * bonus
+            # 차량별 state 기준 계수 적용
+            b_queue, b_starve, b_wait = get_scenario_coeffs_ourspf(vehicles[i].state, cfg)
 
+            marginal_rate = marginal_rb_capacity(float(rate_per_rb[i]), int(alloc[i]), cfg)
+            pf_term = marginal_rate / max(avg_thr[i], cfg.pf_epsilon)
+            bonus = 1.0 + b_queue * q_norm[i] + b_starve * s_norm[i] + b_wait * w_norm[i]
+
+            score = pf_term * bonus
             score /= (1.0 + cfg.intra_slot_decay_ourspf * alloc[i])
             scores[i] = score
 
@@ -512,7 +621,7 @@ def alloc_ours_pf_hybrid(
             break
 
         alloc[best] += 1
-        temp_avg[best] += rate_per_rb[best] / max(1.0, total_rb)
+        remaining_req[best] -= 1
 
     return alloc
 
@@ -579,11 +688,11 @@ def simulate_once(
     scenario: str,
     cfg: SimConfig,
     run_idx: int,
-):
+) -> Tuple[Metrics, List[Dict[str, float | int | str]]]:
     rng = np.random.default_rng(cfg.seed + run_idx)
 
     states = build_vehicle_states(scenario, cfg.n_vehicles, rng)
-    vehicles = make_vehicles(states)
+    vehicles = make_vehicles(states, rng)
 
     n_users = len(vehicles)
     rr_cursor = 0
@@ -597,30 +706,39 @@ def simulate_once(
     sum_unserved_users = 0.0
 
     for slot in range(cfg.n_slots):
-        update_arrivals(vehicles, cfg, rng)
+        update_arrivals(vehicles, rng)
 
         queue_before = np.array([v.queue_bits for v in vehicles], dtype=np.float64)
-        gains = sample_channel_gains([v.state for v in vehicles], rng)
+        gains = sample_channel_gains(vehicles, rng)
         rate_per_rb = shannon_rate_bits_per_rb(gains, cfg)
         active_mask = np.array([v.queue_bits > 0 for v in vehicles], dtype=bool)
 
         requested_rb = np.zeros(n_users, dtype=np.int32)
         for i in range(n_users):
             if active_mask[i]:
-                req = int(np.ceil(queue_before[i] / max(rate_per_rb[i], 1e-9)))
-                req_cap = int(cfg.total_rb * cfg.rb_demand_cap_factor)
-                requested_rb[i] = min(req, max(1, req_cap))
+                requested_rb[i] = estimate_requested_rb(float(queue_before[i]), float(rate_per_rb[i]), cfg)
 
         if scheduler_name == "RR":
-            alloc_rb, rr_cursor = alloc_round_robin(cfg.total_rb, rr_cursor, n_users)
-            alloc_rb = np.where(active_mask, alloc_rb, 0)
+            alloc_rb, rr_cursor = alloc_round_robin(cfg.total_rb, rr_cursor, n_users, active_mask)
 
         elif scheduler_name == "MaxThroughput":
-            alloc_rb = alloc_max_throughput(cfg.total_rb, rate_per_rb, active_mask)
+            alloc_rb = alloc_max_throughput(
+                cfg.total_rb,
+                rate_per_rb,
+                active_mask,
+                requested_rb,
+                cfg,
+            )
 
         elif scheduler_name == "PF":
             alloc_rb = alloc_proportional_fair(
-                cfg.total_rb, rate_per_rb, avg_thr, cfg.pf_epsilon, active_mask
+                cfg.total_rb,
+                rate_per_rb,
+                avg_thr,
+                cfg.pf_epsilon,
+                active_mask,
+                requested_rb,
+                cfg,
             )
 
         elif scheduler_name == "Ours":
@@ -630,6 +748,7 @@ def simulate_once(
                 rate_per_rb,
                 cfg,
                 scenario,
+                requested_rb,
             )
 
         elif scheduler_name == "OursPF":
@@ -640,12 +759,12 @@ def simulate_once(
                 avg_thr,
                 cfg,
                 scenario,
+                requested_rb,
             )
 
         else:
             raise ValueError(f"Unknown scheduler: {scheduler_name}")
 
-        alloc_rb = cap_allocation_by_request(alloc_rb, requested_rb)
         served_bits_arr = serve_queues(vehicles, alloc_rb, rate_per_rb, cfg)
         queue_after = np.array([v.queue_bits for v in vehicles], dtype=np.float64)
 
@@ -659,7 +778,7 @@ def simulate_once(
         sum_allocated_rb += allocated_total
         sum_unserved_users += unserved_users
 
-        do_debug = (slot < cfg.debug_slots) or (cfg.debug_every > 0 and (slot % cfg.debug_every == 0))
+        do_debug = (slot < cfg.debug_slots) or (cfg.debug_every > 0 and slot % cfg.debug_every == 0)
         if do_debug:
             for i, v in enumerate(vehicles):
                 debug_rows.append(
@@ -686,27 +805,26 @@ def simulate_once(
         inst_thr = served_bits_arr / cfg.slot_sec
         avg_thr = 0.9 * avg_thr + 0.1 * inst_thr
 
-    mean_active_users_per_slot = sum_active_users / max(cfg.n_slots, 1)
-    mean_requested_rb_per_slot = sum_requested_rb / max(cfg.n_slots, 1)
-    mean_allocated_rb_per_slot = sum_allocated_rb / max(cfg.n_slots, 1)
-    mean_unserved_users_per_slot = sum_unserved_users / max(cfg.n_slots, 1)
-
     metrics = build_metrics(
         vehicles=vehicles,
         scheduler=scheduler_name,
         scenario=scenario,
         run_idx=run_idx,
         cfg=cfg,
-        mean_active_users_per_slot=mean_active_users_per_slot,
-        mean_requested_rb_per_slot=mean_requested_rb_per_slot,
-        mean_allocated_rb_per_slot=mean_allocated_rb_per_slot,
-        mean_unserved_users_per_slot=mean_unserved_users_per_slot,
+        mean_active_users_per_slot=sum_active_users / max(cfg.n_slots, 1),
+        mean_requested_rb_per_slot=sum_requested_rb / max(cfg.n_slots, 1),
+        mean_allocated_rb_per_slot=sum_allocated_rb / max(cfg.n_slots, 1),
+        mean_unserved_users_per_slot=sum_unserved_users / max(cfg.n_slots, 1),
     )
 
     return metrics, debug_rows
 
 
-def run_experiments(cfg: SimConfig, scenarios: List[str], schedulers: List[str]):
+def run_experiments(
+    cfg: SimConfig,
+    scenarios: List[str],
+    schedulers: List[str],
+) -> Tuple[List[Metrics], List[Dict[str, float | int | str]]]:
     results: List[Metrics] = []
     debug_rows_all: List[Dict[str, float | int | str]] = []
 
@@ -726,33 +844,11 @@ def run_experiments(cfg: SimConfig, scenarios: List[str], schedulers: List[str])
 
 
 def metrics_to_rows(metrics: List[Metrics]) -> List[Dict[str, float | str | int]]:
-    rows: List[Dict[str, float | str | int]] = []
-    for m in metrics:
-        rows.append(
-            {
-                "scenario": m.scenario,
-                "scheduler": m.scheduler,
-                "run_idx": m.run_idx,
-                "total_throughput_bps": m.total_throughput_bps,
-                "avg_delay_sec": m.avg_delay_sec,
-                "fairness": m.fairness,
-                "congestion_avg_throughput_bps": m.congestion_avg_throughput_bps,
-                "normal_avg_throughput_bps": m.normal_avg_throughput_bps,
-                "empty_avg_throughput_bps": m.empty_avg_throughput_bps,
-                "mean_active_users_per_slot": m.mean_active_users_per_slot,
-                "mean_requested_rb_per_slot": m.mean_requested_rb_per_slot,
-                "mean_allocated_rb_per_slot": m.mean_allocated_rb_per_slot,
-                "mean_unserved_users_per_slot": m.mean_unserved_users_per_slot,
-            }
-        )
-    return rows
+    return [asdict(m) for m in metrics]
 
 
-def save_csv(metrics: List[Metrics], out_csv: Path) -> None:
-    import csv
-
+def save_csv_rows(rows: List[Dict], out_csv: Path) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    rows = metrics_to_rows(metrics)
     if not rows:
         return
 
@@ -760,19 +856,6 @@ def save_csv(metrics: List[Metrics], out_csv: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-
-
-def save_debug_csv(debug_rows: List[Dict[str, float | int | str]], out_csv: Path) -> None:
-    import csv
-
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    if not debug_rows:
-        return
-
-    with out_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(debug_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(debug_rows)
 
 
 def aggregate_results(metrics: List[Metrics]) -> Dict[str, Dict[str, Dict[str, float]]]:
@@ -845,7 +928,7 @@ def plot_metric_bars(
     schedulers = list(next(iter(agg.values())).keys())
 
     x = np.arange(len(scenarios))
-    width = 0.18
+    width = 0.16
 
     plt.figure(figsize=(10, 5))
     for i, scheduler in enumerate(schedulers):
@@ -857,6 +940,7 @@ def plot_metric_bars(
     plt.title(f"{ylabel} by scenario")
     plt.legend()
     plt.tight_layout()
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=200)
     plt.close()
@@ -878,7 +962,7 @@ def plot_state_throughput_bars(
     schedulers = list(next(iter(agg.values())).keys())
 
     x = np.arange(len(scenarios))
-    width = 0.18
+    width = 0.16
 
     plt.figure(figsize=(10, 5))
     for i, scheduler in enumerate(schedulers):
@@ -890,6 +974,7 @@ def plot_state_throughput_bars(
     plt.title(f"Average throughput of {target_state} vehicles")
     plt.legend()
     plt.tight_layout()
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=200)
     plt.close()
@@ -901,14 +986,14 @@ def plot_state_throughput_bars(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="RB scheduler simulator (fair-comparison version)")
-    p.add_argument("--total-rb", type=int, default=12)
-    p.add_argument("--n-vehicles", type=int, default=60)
-    p.add_argument("--n-slots", type=int, default=300)
-    p.add_argument("--n-runs", type=int, default=30)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out-dir", type=str, default="sim_out")
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description="Clean RB scheduler simulator")
+    parser.add_argument("--total-rb", type=int, default=12)
+    parser.add_argument("--n-vehicles", type=int, default=60)
+    parser.add_argument("--n-slots", type=int, default=300)
+    parser.add_argument("--n-runs", type=int, default=30)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--out-dir", type=str, default="sim_out")
+    return parser.parse_args()
 
 
 # =========================================================
@@ -944,10 +1029,10 @@ def main() -> None:
     metrics, debug_rows = run_experiments(cfg, scenarios, schedulers)
     agg = aggregate_results(metrics)
 
-    save_csv(metrics, out_dir / "rb_sim_results.csv")
+    save_csv_rows(metrics_to_rows(metrics), out_dir / "rb_sim_results.csv")
 
     if cfg.save_debug_csv:
-        save_debug_csv(debug_rows, out_dir / "rb_sim_debug.csv")
+        save_csv_rows(debug_rows, out_dir / "rb_sim_debug.csv")
 
     save_summary_txt(agg, out_dir / "rb_sim_summary.txt")
 
@@ -960,6 +1045,7 @@ def main() -> None:
     plot_state_throughput_bars(agg, "Empty", plot_dir / "throughput_empty_vehicles.png")
 
     print(f"[SAVE] CSV     : {out_dir / 'rb_sim_results.csv'}")
+    print(f"[SAVE] DEBUG   : {out_dir / 'rb_sim_debug.csv'}")
     print(f"[SAVE] SUMMARY : {out_dir / 'rb_sim_summary.txt'}")
     print(f"[SAVE] PLOTS   : {plot_dir}")
 
