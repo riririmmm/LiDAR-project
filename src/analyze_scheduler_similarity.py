@@ -81,6 +81,21 @@ def group_by_state(rows: list[dict[str, str]]) -> dict[str, list[dict[str, str]]
     return dict(grouped)
 
 
+
+
+def percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    v = sorted(values)
+    if len(v) == 1:
+        return v[0]
+    pos = (len(v) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(v) - 1)
+    w = pos - lo
+    return v[lo] * (1 - w) + v[hi] * w
+
+
 def report_state(rows: list[dict[str, str]], state: str) -> list[str]:
     lines: list[str] = []
     lines.append(f"\n[State] {state}")
@@ -134,22 +149,53 @@ def report_state(rows: list[dict[str, str]], state: str) -> list[str]:
     worst_delay = max(float(x["delay"]) for x in normalized)
     delay_gap_pct = ((worst_delay - best_delay) / max(worst_delay, 1e-9)) * 100
 
-    lines.append(f"- spread: throughput gap={thr_gap_pct:.2f}% , delay gap={delay_gap_pct:.2f}%")
+    lines.append(f"- spread(all): throughput gap={thr_gap_pct:.2f}% , delay gap={delay_gap_pct:.2f}%")
+
+    # robust spread: exclude bottom-throughput scheduler (often MaxThroughput outlier)
+    if len(normalized) >= 4:
+        core = normalized[:-1]
+        core_best_thr = float(core[0]["thr"])
+        core_worst_thr = float(core[-1]["thr"])
+        core_thr_gap_pct = ((core_best_thr - core_worst_thr) / max(core_worst_thr, 1e-9)) * 100
+        core_best_delay = min(float(x["delay"]) for x in core)
+        core_worst_delay = max(float(x["delay"]) for x in core)
+        core_delay_gap_pct = ((core_worst_delay - core_best_delay) / max(core_worst_delay, 1e-9)) * 100
+        lines.append(f"- spread(core): throughput gap={core_thr_gap_pct:.2f}% , delay gap={core_delay_gap_pct:.2f}%")
+
+        similar = core_thr_gap_pct <= 3.0 and core_delay_gap_pct <= 10.0
+        lines.append("- similarity(core): " + ("HIGH (정말 비슷)" if similar else "MEDIUM/LOW (차이 존재)"))
+
+    uns_vals = [float(x["uns_act"]) for x in normalized]
+    uns_p50 = percentile(uns_vals, 0.5)
+    lines.append(f"- unserved/active median across schedulers: {uns_p50:.3f}")
     lines.append("- interpretation: if saturation is HIGH, validate with tail metrics (P95/P99, unserved streak).")
     return lines
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Analyze scheduler similarity from summary CSV")
-    parser.add_argument("--csv", required=True, type=Path, help="Path to rb_simulation_summary.csv")
+    parser = argparse.ArgumentParser(description="Analyze scheduler similarity from summary/results CSV")
+    parser.add_argument("--csv", type=Path, default=None, help="Path to rb_simulation_summary.csv or rb_simulation_results.csv")
     args = parser.parse_args()
 
-    raw_rows = load_rows(args.csv)
+    if args.csv is None:
+        candidates = [
+            Path("src/out_bev_ranges/rb_simulation_summary.csv"),
+            Path("src/out_bev_ranges/rb_simulation_results.csv"),
+            Path(__file__).resolve().parent / "out_bev_ranges" / "rb_simulation_summary.csv",
+            Path(__file__).resolve().parent / "out_bev_ranges" / "rb_simulation_results.csv",
+        ]
+        csv_path = next((c for c in candidates if c.exists()), None)
+        if csv_path is None:
+            raise SystemExit("No CSV path provided and no default file found. Use --csv <path>.")
+    else:
+        csv_path = args.csv
+
+    raw_rows = load_rows(csv_path)
     rows = aggregate_if_needed(raw_rows)
     by_state = group_by_state(rows)
 
     print("=== Scheduler Similarity Diagnostic Report ===")
-    print(f"csv: {args.csv}")
+    print(f"csv: {csv_path}")
     for state, state_rows in sorted(by_state.items()):
         for line in report_state(state_rows, state):
             print(line)
