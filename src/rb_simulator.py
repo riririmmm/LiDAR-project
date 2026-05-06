@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+import yaml
 
 
 # =========================================================
@@ -980,6 +981,27 @@ def plot_state_throughput_bars(
     plt.close()
 
 
+
+
+def load_sim_yaml(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def resolve_sim_config_path(cfg_path: str | None) -> Path:
+    if cfg_path:
+        p = Path(cfg_path).expanduser()
+        return p if p.is_absolute() else (Path.cwd() / p)
+
+    candidates = [
+        Path("src/rb_simulator_config.yaml"),
+        Path(__file__).resolve().parent / "rb_simulator_config.yaml",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    raise FileNotFoundError("rb_simulator_config.yaml not found. Use --config <path>.")
+
 # =========================================================
 # 12) CLI
 # =========================================================
@@ -987,12 +1009,14 @@ def plot_state_throughput_bars(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Clean RB scheduler simulator")
-    parser.add_argument("--total-rb", type=int, default=12)
-    parser.add_argument("--n-vehicles", type=int, default=60)
-    parser.add_argument("--n-slots", type=int, default=300)
-    parser.add_argument("--n-runs", type=int, default=30)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--out-dir", type=str, default="sim_out")
+    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--total-rb", type=int, default=None)
+    parser.add_argument("--n-vehicles", type=int, default=None)
+    parser.add_argument("--n-slots", type=int, default=None)
+    parser.add_argument("--n-runs", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--out-dir", type=str, default=None)
+    parser.add_argument("--preset", type=str, default=None, choices=[None, "", "low_load", "mid_load", "high_load"])
     return parser.parse_args()
 
 
@@ -1004,18 +1028,59 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    cfg_path = resolve_sim_config_path(args.config)
+    raw = load_sim_yaml(cfg_path)
+
+    sim_raw = raw.get("sim", {})
+    total_rb = int(sim_raw.get("total_rb", 12))
+    n_vehicles = int(sim_raw.get("n_vehicles", 60))
+    n_slots = int(sim_raw.get("n_slots", 300))
+    n_runs = int(sim_raw.get("n_runs", 30))
+    seed = int(sim_raw.get("seed", 42))
+
+    out_dir_val = raw.get("output", {}).get("out_dir", "sim_out")
+    preset = raw.get("preset", "")
+
+    if args.total_rb is not None:
+        total_rb = args.total_rb
+    if args.n_vehicles is not None:
+        n_vehicles = args.n_vehicles
+    if args.n_slots is not None:
+        n_slots = args.n_slots
+    if args.n_runs is not None:
+        n_runs = args.n_runs
+    if args.seed is not None:
+        seed = args.seed
+    if args.out_dir is not None:
+        out_dir_val = args.out_dir
+    if args.preset is not None:
+        preset = args.preset
+
+    if preset == "low_load":
+        total_rb, n_vehicles = 24, 30
+    elif preset == "mid_load":
+        total_rb, n_vehicles = 12, 60
+    elif preset == "high_load":
+        total_rb, n_vehicles = 8, 90
+
     cfg = SimConfig(
-        total_rb=args.total_rb,
-        n_vehicles=args.n_vehicles,
-        n_slots=args.n_slots,
-        n_runs=args.n_runs,
-        seed=args.seed,
+        total_rb=total_rb,
+        n_vehicles=n_vehicles,
+        n_slots=n_slots,
+        n_runs=n_runs,
+        seed=seed,
     )
 
-    scenarios = ["balanced", "congestion_heavy", "normal_heavy", "empty_heavy"]
-    schedulers = ["RR", "MaxThroughput", "PF", "Ours", "OursPF"]
+    scenarios = raw.get("experiment", {}).get(
+        "scenarios",
+        ["balanced", "congestion_heavy", "normal_heavy", "empty_heavy"],
+    )
+    schedulers = raw.get("experiment", {}).get(
+        "schedulers",
+        ["RR", "MaxThroughput", "PF", "Ours", "OursPF"],
+    )
 
-    out_dir = Path(args.out_dir)
+    out_dir = Path(out_dir_val)
     plot_dir = out_dir / "plots"
 
     print("[INFO] Start simulation")

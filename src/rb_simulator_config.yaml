@@ -1,0 +1,17 @@
+# RB simulator configuration
+sim:
+  total_rb: 12
+  n_vehicles: 60
+  n_slots: 300
+  n_runs: 30
+  seed: 42
+
+# optional preset override: "", low_load, mid_load, high_load
+preset: ""
+
+output:
+  out_dir: sim_out
+
+experiment:
+  scenarios: ["balanced", "congestion_heavy", "normal_heavy", "empty_heavy"]
+  schedulers: ["RR", "MaxThroughput", "PF", "Ours", "OursPF"]
