@@ -1,9 +1,4 @@
-#!/usr/bin/env python3
-"""Scheduler similarity diagnostic report generator.
-
-Usage:
-  python src/analyze_scheduler_similarity.py --csv src/out_bev_ranges/rb_simulation_summary.csv
-"""
+# 스케줄러 성능 결과 CSV를 읽어서, 상태별(input_state)로 스케줄러들이 얼마나 비슷한지(throughput/delay/fairness 관점) 진단 리포트를 출력
 
 from __future__ import annotations
 
