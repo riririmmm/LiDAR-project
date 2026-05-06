@@ -12,9 +12,10 @@ from datetime import datetime
 from rb_simulator import SimConfig, simulate_once
 
 STATE_LOAD_PRESET = {
-    "Empty": (24, 30),
-    "Normal": (12, 60),
-    "Congestion": (8, 90),
+    # stronger contention to expose scheduler differences
+    "Empty": (12, 60),
+    "Normal": (8, 90),
+    "Congestion": (6, 120),
 }
 
 def find_scorevote_files(root: Path) -> List[Path]:
