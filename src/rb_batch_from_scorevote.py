@@ -7,8 +7,15 @@ import csv
 from pathlib import Path
 from typing import List, Dict, Tuple
 from collections import defaultdict
+from datetime import datetime
 
 from rb_simulator import SimConfig, simulate_once
+
+STATE_LOAD_PRESET = {
+    "Empty": (24, 30),
+    "Normal": (12, 60),
+    "Congestion": (8, 90),
+}
 
 def find_scorevote_files(root: Path) -> List[Path]:
     return sorted(root.rglob("final_event_scorevote.txt"))
@@ -55,12 +62,27 @@ def parse_args():
     p.add_argument("--n-vehicles", type=int, default=default_cfg.n_vehicles)
     p.add_argument("--n-slots", type=int, default=default_cfg.n_slots)
     p.add_argument("--seed", type=int, default=default_cfg.seed)
+    p.add_argument("--state-aware-load", dest="state_aware_load", action="store_true", default=True, help="apply load preset by detected state (default: on)")
+    p.add_argument("--no-state-aware-load", dest="state_aware_load", action="store_false", help="disable state-aware load preset")
     return p.parse_args()
 
 
+
+
+def _safe_open_for_write(target: Path):
+    try:
+        return target.open("w", newline="", encoding="utf-8-sig"), target
+    except PermissionError:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fallback = target.with_name(f"{target.stem}_{ts}{target.suffix}")
+        print(f"[WARN] file locked: {target}")
+        print(f"[WARN] writing to fallback: {fallback}")
+        return fallback.open("w", newline="", encoding="utf-8-sig"), fallback
+
 def save_detail_csv(rows: List[Dict], out_csv: Path) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with out_csv.open("w", newline="", encoding="utf-8-sig") as f:
+    f, actual_path = _safe_open_for_write(out_csv)
+    with f:
         writer = csv.DictWriter(
             f,
             fieldnames=[
@@ -84,7 +106,7 @@ def save_detail_csv(rows: List[Dict], out_csv: Path) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"[SAVE] {out_csv}")
+    print(f"[SAVE] {actual_path}")
 
 
 def save_summary_csv(rows: List[Dict], out_csv: Path) -> None:
@@ -121,7 +143,8 @@ def save_summary_csv(rows: List[Dict], out_csv: Path) -> None:
         g["mean_unserved_users_per_slot"] += float(row["mean_unserved_users_per_slot"])
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with out_csv.open("w", newline="", encoding="utf-8-sig") as f:
+    f, actual_path = _safe_open_for_write(out_csv)
+    with f:
         writer = csv.DictWriter(
             f,
             fieldnames=[
@@ -160,7 +183,7 @@ def save_summary_csv(rows: List[Dict], out_csv: Path) -> None:
                 "mean_unserved_users_per_slot": g["mean_unserved_users_per_slot"] / c,
             })
 
-    print(f"[SAVE] {out_csv}")
+    print(f"[SAVE] {actual_path}")
 
 
 def save_professor_graphs(summary_csv: Path, out_dir: Path) -> None:
@@ -473,11 +496,21 @@ def main() -> None:
             schedulers = ["RR", "MaxThroughput", "PF", "Ours", "OursPF"]
             results = []
 
+            cfg_local = cfg
+            if args.state_aware_load and scenario in STATE_LOAD_PRESET:
+                rb, nv = STATE_LOAD_PRESET[scenario]
+                cfg_local = SimConfig(
+                    total_rb=rb,
+                    n_vehicles=nv,
+                    n_slots=cfg.n_slots,
+                    seed=cfg.seed,
+                )
+
             for scheduler in schedulers:
                 metrics, _debug_rows = simulate_once(
                     scheduler_name=scheduler,
                     scenario=scenario,
-                    cfg=cfg,
+                    cfg=cfg_local,
                     run_idx=file_idx,
                 )
                 results.append(metrics)

@@ -1,7 +1,7 @@
 # RB simulator configuration
 sim:
-  total_rb: 25
-  n_vehicles: 20
+  total_rb: 12
+  n_vehicles: 60
   n_slots: 300
   n_runs: 30
   seed: 42
