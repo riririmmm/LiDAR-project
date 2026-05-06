@@ -19,7 +19,7 @@ import yaml
 @dataclass
 class SimConfig:
     # 무선 자원 설정
-    total_rb: int = 12
+    total_rb: int = 25
     bandwidth_per_rb_hz: float = 180_000.0
     slot_sec: float = 0.1
     n_slots: int = 300
@@ -32,7 +32,7 @@ class SimConfig:
     packet_size_bits: int = 12_000
 
     # 차량 수
-    n_vehicles: int = 120
+    n_vehicles: int = 20
 
     # 반복 실험 수
     n_runs: int = 30
