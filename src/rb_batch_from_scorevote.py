@@ -3,40 +3,89 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
-from pathlib import Path
-from typing import List, Dict, Tuple
-from collections import defaultdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-from rb_simulator import SimConfig, simulate_once
+from complex_rb_simulator import simulate_once
+
+
+@dataclass
+class SimConfig:
+    total_rb: int = 25
+    n_vehicles: int = 20
+    n_slots: int = 300
+    seed: int = 42
+    rb_per_slot: int | None = None
+    input_state: str | None = None
+
 
 STATE_LOAD_PRESET = {
-    # stronger contention to expose scheduler differences
-    "Empty": (12, 60),
-    "Normal": (8, 90),
-    "Congestion": (6, 120),
+    # tuple = (total_rb, n_vehicles)
+    "Empty": (22, 28),
+    "Normal": (20, 40),
+    "Congestion": (14, 60),
 }
+
+SCHEDULERS = ["RR", "PF", "Ours", "OursPF", "MaxThroughput"]
+
+DETAIL_FIELDS = [
+    "sequence",
+    "frame_range",
+    "event_file",
+    "input_state",
+    "scheduler",
+    "total_throughput_bps",
+    "avg_delay_sec",
+    "fairness",
+    "timely_throughput_bps",
+    "deadline_miss_rate",
+    "p95_delay_sec",
+    "p99_delay_sec",
+    "max_unserved_streak",
+    "congestion_avg_throughput_bps",
+    "normal_avg_throughput_bps",
+    "empty_avg_throughput_bps",
+    "active_users_per_slot",
+    "requested_rb_per_slot",
+    "allocated_rb_per_slot",
+    "unserved_users_per_slot",
+]
+
+SUMMARY_FIELDS = [
+    "input_state",
+    "scheduler",
+    "count",
+    "mean_total_throughput_bps",
+    "mean_avg_delay_sec",
+    "mean_fairness",
+    "mean_timely_throughput_bps",
+    "mean_deadline_miss_rate",
+    "mean_p95_delay_sec",
+    "mean_p99_delay_sec",
+    "mean_max_unserved_streak",
+    "mean_congestion_avg_throughput_bps",
+    "mean_normal_avg_throughput_bps",
+    "mean_empty_avg_throughput_bps",
+    "mean_active_users_per_slot",
+    "mean_requested_rb_per_slot",
+    "mean_allocated_rb_per_slot",
+    "mean_unserved_users_per_slot",
+]
+
 
 def find_scorevote_files(root: Path) -> List[Path]:
     return sorted(root.rglob("final_event_scorevote.txt"))
 
 
 def extract_seq_and_range(scorevote_path: Path, root: Path) -> Tuple[str, str]:
-    """
-    예:
-    root = .../out_bev_ranges
-    path = .../out_bev_ranges/00/000000_000300/00_f0000_0300/final_event_scorevote.txt
-
-    -> seq = 00
-    -> frame_range = 000000_000300
-    """
     rel = scorevote_path.relative_to(root)
     parts = rel.parts
-
     seq = parts[0] if len(parts) >= 1 else ""
     frame_range = parts[1] if len(parts) >= 2 else ""
-
     return seq, frame_range
 
 
@@ -49,28 +98,35 @@ def read_final_event_type(scorevote_path: Path) -> str:
     raise ValueError(f"final_event_type not found in {scorevote_path}")
 
 
+def normalize_state(state: str) -> str:
+    s = state.strip().lower()
+    if s in ("congestion", "jam", "trafficjam"):
+        return "Congestion"
+    if s == "normal":
+        return "Normal"
+    if s in ("empty", "light", "sparse"):
+        return "Empty"
+    return "Normal"
+
+
 def parse_args():
-    import argparse
     default_cfg = SimConfig()
+    default_root = Path(__file__).resolve().parent / "out_bev_ranges"
 
     p = argparse.ArgumentParser()
-    p.add_argument(
-        "--root",
-        type=str,
-        default=r"D:\연구실\new_hitmap_ver\src\out_bev_ranges"
-    )
+    p.add_argument("--root", type=str, default=str(default_root))
     p.add_argument("--total-rb", type=int, default=default_cfg.total_rb)
     p.add_argument("--n-vehicles", type=int, default=default_cfg.n_vehicles)
     p.add_argument("--n-slots", type=int, default=default_cfg.n_slots)
+    p.add_argument("--n-runs", type=int, default=1)
     p.add_argument("--seed", type=int, default=default_cfg.seed)
-    p.add_argument("--state-aware-load", dest="state_aware_load", action="store_true", default=True, help="apply load preset by detected state (default: on)")
-    p.add_argument("--no-state-aware-load", dest="state_aware_load", action="store_false", help="disable state-aware load preset")
+    p.add_argument("--state-aware-load", dest="state_aware_load", action="store_true", default=True)
+    p.add_argument("--no-state-aware-load", dest="state_aware_load", action="store_false")
+    p.add_argument("--max-files-per-state", type=int, default=0)
     return p.parse_args()
 
 
-
-
-def _safe_open_for_write(target: Path):
+def safe_open_for_write(target: Path):
     try:
         return target.open("w", newline="", encoding="utf-8-sig"), target
     except PermissionError:
@@ -80,473 +136,129 @@ def _safe_open_for_write(target: Path):
         print(f"[WARN] writing to fallback: {fallback}")
         return fallback.open("w", newline="", encoding="utf-8-sig"), fallback
 
+
 def save_detail_csv(rows: List[Dict], out_csv: Path) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    f, actual_path = _safe_open_for_write(out_csv)
+    f, actual_path = safe_open_for_write(out_csv)
     with f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "sequence",
-                "frame_range",
-                "event_file",
-                "input_state",
-                "scheduler",
-                "total_throughput_bps",
-                "avg_delay_sec",
-                "fairness",
-                "congestion_avg_throughput_bps",
-                "normal_avg_throughput_bps",
-                "empty_avg_throughput_bps",
-                "mean_active_users_per_slot",
-                "mean_requested_rb_per_slot",
-                "mean_allocated_rb_per_slot",
-                "mean_unserved_users_per_slot",
-            ]
-        )
+        writer = csv.DictWriter(f, fieldnames=DETAIL_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
-
     print(f"[SAVE] {actual_path}")
 
 
 def save_summary_csv(rows: List[Dict], out_csv: Path) -> None:
-    """
-    state + scheduler 기준 평균 요약
-    """
-    grouped = defaultdict(lambda: {
-        "count": 0,
-        "total_throughput_bps": 0.0,
-        "avg_delay_sec": 0.0,
-        "fairness": 0.0,
-        "congestion_avg_throughput_bps": 0.0,
-        "normal_avg_throughput_bps": 0.0,
-        "empty_avg_throughput_bps": 0.0,
-        "mean_active_users_per_slot": 0.0,
-        "mean_requested_rb_per_slot": 0.0,
-        "mean_allocated_rb_per_slot": 0.0,
-        "mean_unserved_users_per_slot": 0.0,
-    })
+    grouped: Dict[Tuple[str, str], Dict[str, float]] = {}
+    numeric_fields = [field for field in DETAIL_FIELDS if field not in {"sequence", "frame_range", "event_file", "input_state", "scheduler"}]
 
     for row in rows:
         key = (row["input_state"], row["scheduler"])
-        g = grouped[key]
-        g["count"] += 1
-        g["total_throughput_bps"] += float(row["total_throughput_bps"])
-        g["avg_delay_sec"] += float(row["avg_delay_sec"])
-        g["fairness"] += float(row["fairness"])
-        g["congestion_avg_throughput_bps"] += float(row["congestion_avg_throughput_bps"])
-        g["normal_avg_throughput_bps"] += float(row["normal_avg_throughput_bps"])
-        g["empty_avg_throughput_bps"] += float(row["empty_avg_throughput_bps"])
-        g["mean_active_users_per_slot"] += float(row["mean_active_users_per_slot"])
-        g["mean_requested_rb_per_slot"] += float(row["mean_requested_rb_per_slot"])
-        g["mean_allocated_rb_per_slot"] += float(row["mean_allocated_rb_per_slot"])
-        g["mean_unserved_users_per_slot"] += float(row["mean_unserved_users_per_slot"])
+        g = grouped.setdefault(key, {"count": 0.0, **{field: 0.0 for field in numeric_fields}})
+        g["count"] += 1.0
+        for field in numeric_fields:
+            g[field] += float(row.get(field, 0.0) or 0.0)
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    f, actual_path = _safe_open_for_write(out_csv)
+    f, actual_path = safe_open_for_write(out_csv)
     with f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "input_state",
-                "scheduler",
-                "count",
-                "mean_total_throughput_bps",
-                "mean_avg_delay_sec",
-                "mean_fairness",
-                "mean_congestion_avg_throughput_bps",
-                "mean_normal_avg_throughput_bps",
-                "mean_empty_avg_throughput_bps",
-                "mean_active_users_per_slot",
-                "mean_requested_rb_per_slot",
-                "mean_allocated_rb_per_slot",
-                "mean_unserved_users_per_slot",
-            ]
-        )
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS)
         writer.writeheader()
-
         for (state, scheduler), g in sorted(grouped.items()):
-            c = g["count"]
-            writer.writerow({
-                "input_state": state,
-                "scheduler": scheduler,
-                "count": c,
-                "mean_total_throughput_bps": g["total_throughput_bps"] / c,
-                "mean_avg_delay_sec": g["avg_delay_sec"] / c,
-                "mean_fairness": g["fairness"] / c,
-                "mean_congestion_avg_throughput_bps": g["congestion_avg_throughput_bps"] / c,
-                "mean_normal_avg_throughput_bps": g["normal_avg_throughput_bps"] / c,
-                "mean_empty_avg_throughput_bps": g["empty_avg_throughput_bps"] / c,
-                "mean_active_users_per_slot": g["mean_active_users_per_slot"] / c,
-                "mean_requested_rb_per_slot": g["mean_requested_rb_per_slot"] / c,
-                "mean_allocated_rb_per_slot": g["mean_allocated_rb_per_slot"] / c,
-                "mean_unserved_users_per_slot": g["mean_unserved_users_per_slot"] / c,
-            })
-
+            count = max(g["count"], 1.0)
+            writer.writerow(
+                {
+                    "input_state": state,
+                    "scheduler": scheduler,
+                    "count": int(g["count"]),
+                    "mean_total_throughput_bps": g["total_throughput_bps"] / count,
+                    "mean_avg_delay_sec": g["avg_delay_sec"] / count,
+                    "mean_fairness": g["fairness"] / count,
+                    "mean_timely_throughput_bps": g["timely_throughput_bps"] / count,
+                    "mean_deadline_miss_rate": g["deadline_miss_rate"] / count,
+                    "mean_p95_delay_sec": g["p95_delay_sec"] / count,
+                    "mean_p99_delay_sec": g["p99_delay_sec"] / count,
+                    "mean_max_unserved_streak": g["max_unserved_streak"] / count,
+                    "mean_congestion_avg_throughput_bps": g["congestion_avg_throughput_bps"] / count,
+                    "mean_normal_avg_throughput_bps": g["normal_avg_throughput_bps"] / count,
+                    "mean_empty_avg_throughput_bps": g["empty_avg_throughput_bps"] / count,
+                    "mean_active_users_per_slot": g["active_users_per_slot"] / count,
+                    "mean_requested_rb_per_slot": g["requested_rb_per_slot"] / count,
+                    "mean_allocated_rb_per_slot": g["allocated_rb_per_slot"] / count,
+                    "mean_unserved_users_per_slot": g["unserved_users_per_slot"] / count,
+                }
+            )
     print(f"[SAVE] {actual_path}")
 
 
-def save_professor_graphs(summary_csv: Path, out_dir: Path) -> None:
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    df = pd.read_csv(summary_csv, encoding="utf-8-sig")
-
-    scheduler_order = ["MaxThroughput", "PF", "Ours", "OursPF", "RR"]
-    state_order = ["Empty", "Normal", "Congestion"]
-
-    if "scheduler" in df.columns:
-        df["scheduler"] = pd.Categorical(
-            df["scheduler"], categories=scheduler_order, ordered=True
-        )
-    if "input_state" in df.columns:
-        df["input_state"] = pd.Categorical(
-            df["input_state"], categories=state_order, ordered=True
-        )
-
-    df = df.sort_values(["input_state", "scheduler"])
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    def save_grouped_bar_plot(
-        *,
-        data: pd.DataFrame,
-        y_col: str,
-        title: str,
-        ylabel: str,
-        filename: str,
-        ylim=None,
-    ) -> None:
-        pivot = data.pivot(index="input_state", columns="scheduler", values=y_col)
-        pivot = pivot.reindex(index=state_order, columns=scheduler_order)
-        pivot = pivot.dropna(how="all")
-
-        if pivot.empty:
-            print(f"[WARN] skip empty plot: {filename}")
-            return
-
-        x = np.arange(len(pivot.index))
-        width = 0.16
-
-        plt.figure(figsize=(10, 5))
-        for i, scheduler in enumerate(pivot.columns):
-            vals = pivot[scheduler].values.astype(float)
-            plt.bar(
-                x + i * width - width * (len(pivot.columns) - 1) / 2,
-                vals,
-                width=width,
-                label=scheduler,
-            )
-
-        plt.xticks(x, pivot.index)
-        plt.xlabel("Input State")
-        plt.ylabel(ylabel)
-        plt.title(title)
-        plt.grid(axis="y", linestyle="--", alpha=0.5)
-        if ylim is not None:
-            plt.ylim(*ylim)
-        plt.legend()
-        plt.tight_layout()
-
-        out_path = out_dir / filename
-        plt.savefig(out_path, dpi=200)
-        plt.close()
-        print(f"[SAVE] {out_path}")
-
-    def save_single_state_bar_plot(
-        *,
-        state_name: str,
-        y_col: str,
-        title: str,
-        ylabel: str,
-        filename: str,
-        ylim=None,
-    ) -> None:
-        sub = data_by_state.get(state_name)
-        if sub is None or sub.empty:
-            print(f"[WARN] skip empty plot: {filename}")
-            return
-
-        sub = sub.sort_values("scheduler")
-
-        plt.figure(figsize=(8, 5))
-        plt.bar(sub["scheduler"], sub[y_col])
-        plt.xlabel("Scheduler")
-        plt.ylabel(ylabel)
-        plt.title(title)
-        plt.grid(axis="y", linestyle="--", alpha=0.5)
-        if ylim is not None:
-            plt.ylim(*ylim)
-        plt.tight_layout()
-
-        out_path = out_dir / filename
-        plt.savefig(out_path, dpi=200)
-        plt.close()
-        print(f"[SAVE] {out_path}")
-
-    def save_state_vehicle_throughput_plot(
-        *,
-        state_name: str,
-        filename: str,
-    ) -> None:
-        sub = data_by_state.get(state_name)
-        if sub is None or sub.empty:
-            print(f"[WARN] skip empty plot: {filename}")
-            return
-
-        sub = sub.sort_values("scheduler")
-        x = np.arange(len(sub))
-        width = 0.23
-
-        plt.figure(figsize=(9, 5))
-        plt.bar(
-            x - width,
-            sub["mean_congestion_avg_throughput_bps"],
-            width=width,
-            label="Congestion vehicles",
-        )
-        plt.bar(
-            x,
-            sub["mean_normal_avg_throughput_bps"],
-            width=width,
-            label="Normal vehicles",
-        )
-        plt.bar(
-            x + width,
-            sub["mean_empty_avg_throughput_bps"],
-            width=width,
-            label="Empty vehicles",
-        )
-
-        plt.xticks(x, sub["scheduler"])
-        plt.xlabel("Scheduler")
-        plt.ylabel("Average throughput (bps)")
-        plt.title(f"Vehicle-type Throughput in {state_name} State")
-        plt.grid(axis="y", linestyle="--", alpha=0.5)
-        plt.legend()
-        plt.tight_layout()
-
-        out_path = out_dir / filename
-        plt.savefig(out_path, dpi=200)
-        plt.close()
-        print(f"[SAVE] {out_path}")
-
-    def save_tradeoff_scatter(
-        *,
-        state_name: str,
-        x_col: str,
-        y_col: str,
-        title: str,
-        xlabel: str,
-        ylabel: str,
-        filename: str,
-    ) -> None:
-        sub = data_by_state.get(state_name)
-        if sub is None or sub.empty:
-            print(f"[WARN] skip empty plot: {filename}")
-            return
-
-        sub = sub.sort_values("scheduler")
-
-        plt.figure(figsize=(7, 5))
-        for _, row in sub.iterrows():
-            x = float(row[x_col])
-            y = float(row[y_col])
-            label = str(row["scheduler"])
-            plt.scatter(x, y, s=90)
-            plt.annotate(label, (x, y), textcoords="offset points", xytext=(5, 5))
-
-        plt.xlabel(xlabel)
-        plt.ylabel(ylabel)
-        plt.title(title)
-        plt.grid(True, linestyle="--", alpha=0.5)
-        plt.tight_layout()
-
-        out_path = out_dir / filename
-        plt.savefig(out_path, dpi=200)
-        plt.close()
-        print(f"[SAVE] {out_path}")
-
-    data_by_state = {
-        state: df[df["input_state"] == state].sort_values("scheduler")
-        for state in state_order
+def metric_to_row(metrics, *, seq: str, frame_range: str, event_file: Path, input_state: str) -> Dict:
+    metric_dict = asdict(metrics)
+    return {
+        "sequence": seq,
+        "frame_range": frame_range,
+        "event_file": str(event_file),
+        "input_state": input_state,
+        **metric_dict,
     }
-
-    # 1) 전체 상태 비교 그래프
-    save_grouped_bar_plot(
-        data=df,
-        y_col="mean_total_throughput_bps",
-        title="Total Throughput by Input State",
-        ylabel="Throughput (bps)",
-        filename="01_total_throughput_by_state.png",
-    )
-    save_grouped_bar_plot(
-        data=df,
-        y_col="mean_avg_delay_sec",
-        title="Average Delay by Input State",
-        ylabel="Delay (sec)",
-        filename="02_average_delay_by_state.png",
-    )
-    save_grouped_bar_plot(
-        data=df,
-        y_col="mean_fairness",
-        title="Fairness by Input State",
-        ylabel="Jain Fairness",
-        filename="03_fairness_by_state.png",
-        ylim=(0, 1),
-    )
-    save_grouped_bar_plot(
-        data=df,
-        y_col="mean_unserved_users_per_slot",
-        title="Unserved Users per Slot by Input State",
-        ylabel="Unserved Users",
-        filename="04_unserved_users_by_state.png",
-    )
-
-    # 2) 상태별 차량 유형 throughput 분해
-    for state_name in state_order:
-        save_state_vehicle_throughput_plot(
-            state_name=state_name,
-            filename=f"05_vehicle_type_throughput_{state_name.lower()}.png",
-        )
-
-    # 3) 상태별 단독 비교 그래프
-    for state_name in state_order:
-        save_single_state_bar_plot(
-            state_name=state_name,
-            y_col="mean_total_throughput_bps",
-            title=f"Total Throughput in {state_name} State",
-            ylabel="Throughput (bps)",
-            filename=f"06_{state_name.lower()}_throughput.png",
-        )
-        save_single_state_bar_plot(
-            state_name=state_name,
-            y_col="mean_avg_delay_sec",
-            title=f"Average Delay in {state_name} State",
-            ylabel="Delay (sec)",
-            filename=f"07_{state_name.lower()}_delay.png",
-        )
-        save_single_state_bar_plot(
-            state_name=state_name,
-            y_col="mean_fairness",
-            title=f"Fairness in {state_name} State",
-            ylabel="Jain Fairness",
-            filename=f"08_{state_name.lower()}_fairness.png",
-            ylim=(0, 1),
-        )
-        save_single_state_bar_plot(
-            state_name=state_name,
-            y_col="mean_unserved_users_per_slot",
-            title=f"Unserved Users per Slot in {state_name} State",
-            ylabel="Unserved Users",
-            filename=f"09_{state_name.lower()}_unserved.png",
-        )
-
-    # 4) trade-off scatter
-    for state_name in state_order:
-        save_tradeoff_scatter(
-            state_name=state_name,
-            x_col="mean_fairness",
-            y_col="mean_total_throughput_bps",
-            title=f"Throughput-Fairness Tradeoff ({state_name})",
-            xlabel="Jain Fairness",
-            ylabel="Total Throughput (bps)",
-            filename=f"10_tradeoff_throughput_fairness_{state_name.lower()}.png",
-        )
-        save_tradeoff_scatter(
-            state_name=state_name,
-            x_col="mean_avg_delay_sec",
-            y_col="mean_fairness",
-            title=f"Delay-Fairness Tradeoff ({state_name})",
-            xlabel="Average Delay (sec)",
-            ylabel="Jain Fairness",
-            filename=f"11_tradeoff_delay_fairness_{state_name.lower()}.png",
-        )
 
 
 def main() -> None:
     args = parse_args()
     root = Path(args.root)
-
-    # 출력 파일
-    out_detail_csv = root / "rb_simulation_results.csv"
-    out_summary_csv = root / "rb_simulation_summary.csv"
-
-    # 시뮬레이터 설정
-    cfg = SimConfig(
-        total_rb=args.total_rb,
-        n_vehicles=args.n_vehicles,
-        n_slots=args.n_slots,
-        seed=args.seed,
-    )
-
     scorevote_files = find_scorevote_files(root)
-    if not scorevote_files:
-        print(f"[WARN] no final_event_scorevote.txt found under: {root}")
-        return
+    print(f"[INFO] root: {root}")
+    print(f"[INFO] scorevote files: {len(scorevote_files)}")
 
     rows: List[Dict] = []
-
-    for file_idx, fpath in enumerate(scorevote_files):
+    processed_by_state: Dict[str, int] = {}
+    for file_idx, scorevote_path in enumerate(scorevote_files):
         try:
-            state = read_final_event_type(fpath)
-            seq, frame_range = extract_seq_and_range(fpath, root)
+            input_state = normalize_state(read_final_event_type(scorevote_path))
+            if args.max_files_per_state > 0:
+                current_count = processed_by_state.get(input_state, 0)
+                if current_count >= args.max_files_per_state:
+                    continue
+                processed_by_state[input_state] = current_count + 1
+            seq, frame_range = extract_seq_and_range(scorevote_path, root)
 
-            scenario = state.strip()
-            schedulers = ["RR", "MaxThroughput", "PF", "Ours", "OursPF"]
-            results = []
+            total_rb = args.total_rb
+            n_vehicles = args.n_vehicles
+            if args.state_aware_load:
+                total_rb, n_vehicles = STATE_LOAD_PRESET.get(input_state, (total_rb, n_vehicles))
 
-            cfg_local = cfg
-            if args.state_aware_load and scenario in STATE_LOAD_PRESET:
-                rb, nv = STATE_LOAD_PRESET[scenario]
-                cfg_local = SimConfig(
-                    total_rb=rb,
-                    n_vehicles=nv,
-                    n_slots=cfg.n_slots,
-                    seed=cfg.seed,
-                )
+            for scheduler in SCHEDULERS:
+                for run_idx in range(max(1, int(args.n_runs))):
+                    cfg = SimConfig(
+                        total_rb=total_rb,
+                        n_vehicles=n_vehicles,
+                        n_slots=args.n_slots,
+                        seed=args.seed + file_idx * 1000,
+                        rb_per_slot=total_rb,
+                        input_state=input_state,
+                    )
+                    result = simulate_once(
+                        scenario=scorevote_path,
+                        scheduler=scheduler,
+                        cfg=cfg,
+                        run_idx=run_idx,
+                    )
+                    metrics = result[0] if isinstance(result, tuple) else result
+                    rows.append(
+                        metric_to_row(
+                            metrics,
+                            seq=seq,
+                            frame_range=frame_range,
+                            event_file=scorevote_path,
+                            input_state=input_state,
+                        )
+                    )
+        except Exception as exc:
+            print(f"[FAIL] {scorevote_path}: {exc}")
 
-            for scheduler in schedulers:
-                metrics, _debug_rows = simulate_once(
-                    scheduler_name=scheduler,
-                    scenario=scenario,
-                    cfg=cfg_local,
-                    run_idx=file_idx,
-                )
-                results.append(metrics)
-
-            for r in results:
-                rows.append({
-                    "sequence": seq,
-                    "frame_range": frame_range,
-                    "event_file": str(fpath),
-                    "input_state": state,
-                    "scheduler": r.scheduler,
-                    "total_throughput_bps": r.total_throughput_bps,
-                    "avg_delay_sec": r.avg_delay_sec,
-                    "fairness": r.fairness,
-                    "congestion_avg_throughput_bps": r.congestion_avg_throughput_bps,
-                    "normal_avg_throughput_bps": r.normal_avg_throughput_bps,
-                    "empty_avg_throughput_bps": r.empty_avg_throughput_bps,
-                    "mean_active_users_per_slot": r.mean_active_users_per_slot,
-                    "mean_requested_rb_per_slot": r.mean_requested_rb_per_slot,
-                    "mean_allocated_rb_per_slot": r.mean_allocated_rb_per_slot,
-                    "mean_unserved_users_per_slot": r.mean_unserved_users_per_slot,
-                })
-
-            print(f"[OK] seq={seq} range={frame_range} state={state}")
-
-        except Exception as e:
-            print(f"[FAIL] {fpath}: {e}")
-
-    save_detail_csv(rows, out_detail_csv)
-    save_summary_csv(rows, out_summary_csv)
-
-    graph_dir = root / "professor_graphs"
-    save_professor_graphs(out_summary_csv, graph_dir)
-
-    print(f"[INFO] total simulated cases = {len(rows)}")
+    detail_csv = root / "rb_simulation_results.csv"
+    summary_csv = root / "rb_simulation_summary.csv"
+    save_detail_csv(rows, detail_csv)
+    save_summary_csv(rows, summary_csv)
+    print("[DONE]")
 
 
 if __name__ == "__main__":

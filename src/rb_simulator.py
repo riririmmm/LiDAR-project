@@ -51,15 +51,15 @@ class SimConfig:
     rb_demand_cap_factor: float = 2.0
 
     # Ours coefficients
-    ours_rate_coeff_cong: float = 0.55
-    ours_queue_coeff_cong: float = 0.45
-    ours_starve_coeff_cong: float = 0.45
-    ours_wait_coeff_cong: float = 0.30
+    ours_rate_coeff_cong: float = 0.50
+    ours_queue_coeff_cong: float = 0.60
+    ours_starve_coeff_cong: float = 0.60
+    ours_wait_coeff_cong: float = 0.40
 
-    ours_rate_coeff_normal: float = 0.65
-    ours_queue_coeff_normal: float = 0.30
-    ours_starve_coeff_normal: float = 0.20
-    ours_wait_coeff_normal: float = 0.15
+    ours_rate_coeff_normal: float = 0.60
+    ours_queue_coeff_normal: float = 0.40
+    ours_starve_coeff_normal: float = 0.35
+    ours_wait_coeff_normal: float = 0.25
 
     ours_rate_coeff_empty: float = 0.75
     ours_queue_coeff_empty: float = 0.15
@@ -80,7 +80,7 @@ class SimConfig:
     ourspf_wait_coeff_empty: float = 0.05
 
     # 이번 슬롯 내 과몰빵 방지
-    intra_slot_decay_ours: float = 0.80
+    intra_slot_decay_ours: float = 0.78
     intra_slot_decay_ourspf: float = 0.20
 
     # 디버그 옵션
@@ -167,19 +167,19 @@ def normalize_scenario_name(scenario: str) -> str:
 STATE_ENV: Dict[str, Dict[str, float]] = {
     # Higher traffic demand + worse average channel in congestion
     "Congestion": {
-        "arrival_pkts": 35.0,
+        "arrival_pkts": 10.0,
         "base_gain": 0.18,
-        "shadow_sigma_db": 2.5,
+        "shadow_sigma_db": 5.0,
     },
     "Normal": {
-        "arrival_pkts": 20.0,
+        "arrival_pkts": 7.0,
         "base_gain": 0.45,
-        "shadow_sigma_db": 2.0,
+        "shadow_sigma_db": 4.0,
     },
     "Empty": {
-        "arrival_pkts": 10.0,
+        "arrival_pkts": 3.0,
         "base_gain": 0.90,
-        "shadow_sigma_db": 1.5,
+        "shadow_sigma_db": 3.0,
     },
 }
 
@@ -919,6 +919,13 @@ def save_summary_txt(agg: Dict[str, Dict[str, Dict[str, float]]], out_txt: Path)
 # =========================================================
 
 
+PLOT_EXCLUDED_SCHEDULERS = {"OursPF"}
+
+
+def get_plot_schedulers(schedulers) -> List[str]:
+    return [scheduler for scheduler in schedulers if scheduler not in PLOT_EXCLUDED_SCHEDULERS]
+
+
 def plot_metric_bars(
     agg: Dict[str, Dict[str, Dict[str, float]]],
     metric_name: str,
@@ -926,7 +933,7 @@ def plot_metric_bars(
     out_path: Path,
 ) -> None:
     scenarios = list(agg.keys())
-    schedulers = list(next(iter(agg.values())).keys())
+    schedulers = get_plot_schedulers(next(iter(agg.values())).keys())
 
     x = np.arange(len(scenarios))
     width = 0.16
@@ -960,7 +967,7 @@ def plot_state_throughput_bars(
     metric_name = key_map[target_state]
 
     scenarios = list(agg.keys())
-    schedulers = list(next(iter(agg.values())).keys())
+    schedulers = get_plot_schedulers(next(iter(agg.values())).keys())
 
     x = np.arange(len(scenarios))
     width = 0.16
